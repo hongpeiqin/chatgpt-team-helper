@@ -118,7 +118,7 @@ const RESYNC_AFTER_ACTION_DELAY_MS = 3000
 let resyncAfterActionTimer: ReturnType<typeof setTimeout> | null = null
 let resyncAfterActionVersion = 0
 
-const formData = ref<CreateGptAccountDto>({
+const createEmptyFormData = (): CreateGptAccountDto => ({
   email: '',
   token: '',
   refreshToken: '',
@@ -129,6 +129,11 @@ const formData = ref<CreateGptAccountDto>({
   oaiDeviceId: '',
   expireAt: ''
 })
+
+const formData = ref<CreateGptAccountDto>(createEmptyFormData())
+const sessionJsonInput = ref('')
+const sessionJsonError = ref('')
+const parsingSessionJson = ref(false)
 
 const checkingAccessToken = ref(false)
 const checkedChatgptAccounts = ref<ChatgptAccountCheckInfo[]>([])
@@ -166,6 +171,255 @@ const logHttpErrorWithBody = (label: string, err: any) => {
     })
   } catch (error) {
     console.error(label, err, error)
+  }
+}
+
+const isPlainObject = (value: unknown): value is Record<string, any> => {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+const normalizeSessionKey = (value: string) => String(value || '').replace(/[^a-z0-9]/gi, '').toLowerCase()
+
+const getValueByPath = (source: unknown, path: string[]): unknown => {
+  let current: unknown = source
+
+  for (const segment of path) {
+    if (Array.isArray(current)) {
+      if (!/^\d+$/.test(segment)) return undefined
+      current = current[Number(segment)]
+      continue
+    }
+
+    if (!isPlainObject(current)) {
+      return undefined
+    }
+
+    const normalizedSegment = normalizeSessionKey(segment)
+    const matchedKey = Object.keys(current).find(key => normalizeSessionKey(key) === normalizedSegment)
+    if (!matchedKey) {
+      return undefined
+    }
+    current = current[matchedKey]
+  }
+
+  return current
+}
+
+const findFirstStringByPaths = (source: unknown, paths: string[][]): string => {
+  for (const path of paths) {
+    const value = getValueByPath(source, path)
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim()
+    }
+  }
+  return ''
+}
+
+const findFirstDeepString = (source: unknown, aliases: string[]): string => {
+  const normalizedAliases = new Set(aliases.map(normalizeSessionKey))
+  const queue: unknown[] = [source]
+  const seen = new Set<unknown>()
+
+  while (queue.length) {
+    const current = queue.shift()
+    if (!current || typeof current !== 'object' || seen.has(current)) {
+      continue
+    }
+
+    seen.add(current)
+
+    if (Array.isArray(current)) {
+      for (const item of current) {
+        queue.push(item)
+      }
+      continue
+    }
+
+    for (const [key, value] of Object.entries(current)) {
+      if (normalizedAliases.has(normalizeSessionKey(key)) && typeof value === 'string' && value.trim()) {
+        return value.trim()
+      }
+      if (value && typeof value === 'object') {
+        queue.push(value)
+      }
+    }
+  }
+
+  return ''
+}
+
+const findFirstDeepNumber = (source: unknown, aliases: string[]): number | null => {
+  const normalizedAliases = new Set(aliases.map(normalizeSessionKey))
+  const queue: unknown[] = [source]
+  const seen = new Set<unknown>()
+
+  while (queue.length) {
+    const current = queue.shift()
+    if (!current || typeof current !== 'object' || seen.has(current)) {
+      continue
+    }
+
+    seen.add(current)
+
+    if (Array.isArray(current)) {
+      for (const item of current) {
+        queue.push(item)
+      }
+      continue
+    }
+
+    for (const [key, value] of Object.entries(current)) {
+      if (normalizedAliases.has(normalizeSessionKey(key))) {
+        if (typeof value === 'number' && Number.isFinite(value)) {
+          return value
+        }
+        if (typeof value === 'string' && value.trim()) {
+          const parsed = Number(value)
+          if (Number.isFinite(parsed)) {
+            return parsed
+          }
+        }
+      }
+      if (value && typeof value === 'object') {
+        queue.push(value)
+      }
+    }
+  }
+
+  return null
+}
+
+const normalizeAccessToken = (value: string) => String(value || '').trim().replace(/^Bearer\s+/i, '')
+
+const getSingleAccountCandidate = (source: unknown): Record<string, any> | null => {
+  const candidatePaths = [
+    ['accounts'],
+    ['accountInfo', 'accounts'],
+    ['accountInfo', 'availableAccounts'],
+    ['data', 'accounts']
+  ]
+
+  for (const path of candidatePaths) {
+    const value = getValueByPath(source, path)
+    if (Array.isArray(value) && value.length === 1 && isPlainObject(value[0])) {
+      return value[0]
+    }
+  }
+
+  return null
+}
+
+const parseSessionJsonInput = (value: string) => {
+  const raw = String(value || '').trim()
+  if (!raw) {
+    throw new Error('请先粘贴 session JSON')
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch (error) {
+    throw new Error('JSON 格式无效，请检查后重试')
+  }
+
+  if (typeof parsed === 'string') {
+    const nested = parsed.trim()
+    if (nested.startsWith('{') || nested.startsWith('[')) {
+      try {
+        parsed = JSON.parse(nested)
+      } catch {
+        // keep original string result
+      }
+    }
+  }
+
+  if (Array.isArray(parsed) && parsed.length === 1 && isPlainObject(parsed[0])) {
+    parsed = parsed[0]
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('仅支持解析 JSON 对象')
+  }
+
+  const singleAccount = getSingleAccountCandidate(parsed)
+  const email = findFirstStringByPaths(parsed, [
+    ['email'],
+    ['user', 'email'],
+    ['profile', 'email'],
+    ['accountInfo', 'email'],
+    ['account', 'email']
+  ]) || findFirstDeepString(parsed, ['email'])
+
+  const token = normalizeAccessToken(
+    findFirstStringByPaths(parsed, [
+      ['accessToken'],
+      ['access_token'],
+      ['tokens', 'accessToken'],
+      ['tokens', 'access_token'],
+      ['auth', 'accessToken'],
+      ['session', 'accessToken'],
+      ['credentials', 'accessToken'],
+      ['token']
+    ]) || findFirstDeepString(parsed, ['accessToken', 'access_token'])
+  )
+
+  const refreshToken = findFirstStringByPaths(parsed, [
+    ['refreshToken'],
+    ['refresh_token'],
+    ['tokens', 'refreshToken'],
+    ['tokens', 'refresh_token'],
+    ['auth', 'refreshToken'],
+    ['session', 'refreshToken'],
+    ['credentials', 'refreshToken']
+  ]) || findFirstDeepString(parsed, ['refreshToken', 'refresh_token'])
+
+  const chatgptAccountId = findFirstStringByPaths(parsed, [
+    ['chatgptAccountId'],
+    ['chatgpt_account_id'],
+    ['accountInfo', 'accountId'],
+    ['accountInfo', 'chatgptAccountId'],
+    ['account', 'accountId'],
+    ['account', 'chatgptAccountId']
+  ]) || (
+    singleAccount
+      ? findFirstStringByPaths(singleAccount, [['accountId'], ['chatgptAccountId'], ['chatgpt_account_id']])
+      : ''
+  )
+
+  const oaiDeviceId = findFirstStringByPaths(parsed, [
+    ['oaiDeviceId'],
+    ['oai_device_id'],
+    ['headers', 'oai-device-id'],
+    ['headers', 'oaiDeviceId'],
+    ['deviceId'],
+    ['device_id']
+  ]) || findFirstDeepString(parsed, ['oaiDeviceId', 'oai_device_id', 'oaidid'])
+
+  const expireAt = findFirstStringByPaths(parsed, [
+    ['expireAt'],
+    ['expire_at'],
+    ['expiresAt'],
+    ['expires_at'],
+    ['accountInfo', 'expiresAt'],
+    ['accountInfo', 'expireAt'],
+    ['entitlement', 'expiresAt'],
+    ['entitlement', 'expires_at']
+  ]) || (
+    singleAccount
+      ? findFirstStringByPaths(singleAccount, [['expiresAt'], ['expireAt'], ['expires_at'], ['expire_at']])
+      : ''
+  )
+
+  const userCount = findFirstDeepNumber(parsed, ['userCount', 'user_count'])
+
+  return {
+    email,
+    token,
+    refreshToken,
+    chatgptAccountId,
+    oaiDeviceId,
+    expireAt,
+    userCount
   }
 }
 
@@ -340,34 +594,20 @@ const handleExchangeOpenaiCode = async () => {
       }
     }
 
-    // OAuth 交换接口不会返回 Team 订阅到期时间；这里用 access token 额外拉一次账号信息，
-    // 尝试自动填充过期时间（entitlement.expires_at）。
     if (accessToken) {
-      const alreadyChecking = checkingAccessToken.value
-      if (!alreadyChecking) {
-        checkingAccessToken.value = true
-      }
       try {
-        const checked = await gptAccountService.checkAccessToken(accessToken)
-        if (currentNonce !== openaiOAuthFlowNonce) return
-
-        checkedChatgptAccounts.value = Array.isArray(checked?.accounts) ? checked.accounts : []
-        checkAccessTokenError.value = ''
-
-        const preferredId = String(formData.value.chatgptAccountId || accountId || '').trim()
-        if (preferredId) {
-          applyCheckedAccountSelection(preferredId)
-        }
+        await inspectAccessToken(accessToken, {
+          showSuccessToast: false,
+          showEmptyAccountsToast: false,
+          showErrorToast: false,
+          openDropdown: false
+        })
       } catch (err: any) {
         if (currentNonce !== openaiOAuthFlowNonce) return
         logHttpErrorWithBody('[Accounts] 校验 token 失败（OAuth 自动检查）', err)
         // 不阻塞主流程，失败时允许用户手动填写
         const message = resolveRequestError(err, '获取账号到期时间失败')
         checkAccessTokenError.value = message
-      } finally {
-        if (!alreadyChecking && currentNonce === openaiOAuthFlowNonce) {
-          checkingAccessToken.value = false
-        }
       }
     }
 
@@ -485,6 +725,15 @@ const isoToDatetimeLocal = (isoString: string): string => {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 }
 
+const normalizeExpireAtForInput = (value: string): string => {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?$/.test(raw)) {
+    return raw.length === 16 ? `${raw}:00` : raw
+  }
+  return toDatetimeLocal(raw) || isoToDatetimeLocal(raw)
+}
+
 const applyCheckedAccountSelection = (accountId: string) => {
   const normalized = String(accountId || '').trim()
   if (!normalized) return
@@ -512,11 +761,23 @@ const openChatgptIdDropdown = async () => {
   }
 }
 
-const handleCheckAccessToken = async () => {
-  const token = String(formData.value.token || '').trim()
+const inspectAccessToken = async (
+  accessToken: string,
+  options: {
+    showSuccessToast?: boolean
+    showEmptyAccountsToast?: boolean
+    showErrorToast?: boolean
+    openDropdown?: boolean
+  } = {}
+) => {
+  const token = normalizeAccessToken(accessToken)
   if (!token) {
-    showErrorToast('请先填写 Access Token')
-    return
+    const message = '请先填写 Access Token'
+    checkAccessTokenError.value = message
+    if (options.showErrorToast !== false) {
+      showErrorToast(message)
+    }
+    return []
   }
 
   try {
@@ -527,11 +788,15 @@ const handleCheckAccessToken = async () => {
     checkedChatgptAccounts.value = Array.isArray(result?.accounts) ? result.accounts : []
 
     if (!checkedChatgptAccounts.value.length) {
-      showErrorToast('校验成功，但未返回可用账号（可能没有 Team 账号权限）')
-      return
+      if (options.showEmptyAccountsToast !== false) {
+        showErrorToast('校验成功，但未返回可用账号（可能没有 Team 账号权限）')
+      }
+      return []
     }
 
-    showSuccessToast(`校验成功：获取到 ${checkedChatgptAccounts.value.length} 个账号`)
+    if (options.showSuccessToast !== false) {
+      showSuccessToast(`校验成功：获取到 ${checkedChatgptAccounts.value.length} 个账号`)
+    }
 
     // If user hasn't filled chatgptAccountId yet and there is only 1 option, autofill it.
     if (!String(formData.value.chatgptAccountId || '').trim() && checkedChatgptAccounts.value.length === 1) {
@@ -539,14 +804,107 @@ const handleCheckAccessToken = async () => {
     }
 
     applyCheckedAccountSelection(formData.value.chatgptAccountId)
-    await openChatgptIdDropdown()
+    if (options.openDropdown !== false) {
+      await openChatgptIdDropdown()
+    }
+    return checkedChatgptAccounts.value
   } catch (err: any) {
     const message = err?.response?.data?.error || '校验失败'
     logHttpErrorWithBody('[Accounts] 校验 token 失败', err)
     checkAccessTokenError.value = message
-    showErrorToast(message)
+    if (options.showErrorToast !== false) {
+      showErrorToast(message)
+    }
+    return []
   } finally {
     checkingAccessToken.value = false
+  }
+}
+
+const handleCheckAccessToken = async () => {
+  await inspectAccessToken(formData.value.token, {
+    showSuccessToast: true,
+    showEmptyAccountsToast: true,
+    showErrorToast: true,
+    openDropdown: true
+  })
+}
+
+const resetAccountDialogState = () => {
+  editingAccount.value = null
+  formData.value = createEmptyFormData()
+  checkedChatgptAccounts.value = []
+  checkAccessTokenError.value = ''
+  checkingAccessToken.value = false
+  sessionJsonInput.value = ''
+  sessionJsonError.value = ''
+  parsingSessionJson.value = false
+  resetOpenaiOAuthFlow()
+}
+
+const openCreateDialog = () => {
+  resetAccountDialogState()
+  showDialog.value = true
+}
+
+const handleParseSessionJson = async () => {
+  try {
+    parsingSessionJson.value = true
+    sessionJsonError.value = ''
+
+    const parsed = parseSessionJsonInput(sessionJsonInput.value)
+    const filledFields: string[] = []
+
+    if (parsed.email) {
+      formData.value.email = parsed.email
+      filledFields.push('邮箱')
+    }
+    if (parsed.token) {
+      formData.value.token = parsed.token
+      filledFields.push('Access Token')
+    }
+    if (parsed.refreshToken) {
+      formData.value.refreshToken = parsed.refreshToken
+      filledFields.push('Refresh Token')
+    }
+    if (parsed.chatgptAccountId) {
+      formData.value.chatgptAccountId = parsed.chatgptAccountId
+      filledFields.push('ChatGPT ID')
+    }
+    if (parsed.oaiDeviceId) {
+      formData.value.oaiDeviceId = parsed.oaiDeviceId
+      filledFields.push('设备 ID')
+    }
+    if (typeof parsed.userCount === 'number' && Number.isFinite(parsed.userCount)) {
+      formData.value.userCount = Math.max(0, parsed.userCount)
+      filledFields.push('已加入人数')
+    }
+
+    const normalizedExpireAt = normalizeExpireAtForInput(parsed.expireAt)
+    if (normalizedExpireAt) {
+      formData.value.expireAt = normalizedExpireAt
+      filledFields.push('过期时间')
+    }
+
+    if (!filledFields.length) {
+      throw new Error('未从 JSON 中识别到可用字段，请确认包含 accessToken / refreshToken / email / chatgptAccountId 等信息')
+    }
+
+    if (parsed.token) {
+      await inspectAccessToken(parsed.token, {
+        showSuccessToast: false,
+        showEmptyAccountsToast: false,
+        showErrorToast: false,
+        openDropdown: !String(formData.value.chatgptAccountId || '').trim()
+      })
+    }
+
+    showSuccessToast(`已解析并填入：${filledFields.join('、')}`)
+  } catch (err: any) {
+    sessionJsonError.value = err?.message || '解析 session JSON 失败'
+    showErrorToast(sessionJsonError.value)
+  } finally {
+    parsingSessionJson.value = false
   }
 }
 
@@ -934,6 +1292,12 @@ watch(searchQuery, () => {
   }, 300)
 })
 
+watch(showDialog, (open, previousOpen) => {
+  if (!open && previousOpen) {
+    resetAccountDialogState()
+  }
+})
+
 watch(
   () => formData.value.chatgptAccountId,
   (nextValue) => {
@@ -942,6 +1306,13 @@ watch(
 )
 
 const openEditDialog = (account: GptAccount) => {
+  sessionJsonInput.value = ''
+  sessionJsonError.value = ''
+  parsingSessionJson.value = false
+  checkedChatgptAccounts.value = []
+  checkAccessTokenError.value = ''
+  checkingAccessToken.value = false
+  resetOpenaiOAuthFlow()
   editingAccount.value = account
 	  formData.value = {
 	    email: account.email,
@@ -957,15 +1328,9 @@ const openEditDialog = (account: GptAccount) => {
   showDialog.value = true
 }
 
-	const closeDialog = () => {
-	  showDialog.value = false
-	  editingAccount.value = null
-	  formData.value = { email: '', token: '', refreshToken: '', userCount: 0, isBanned: false, isOpen: true, chatgptAccountId: '', oaiDeviceId: '', expireAt: '' }
-	  checkedChatgptAccounts.value = []
-	  checkAccessTokenError.value = ''
-	  checkingAccessToken.value = false
-	  resetOpenaiOAuthFlow()
-	}
+const closeDialog = () => {
+  showDialog.value = false
+}
 
 const handleSubmit = async () => {
   try {
@@ -1328,7 +1693,7 @@ const handleInviteSubmit = async () => {
           检查
         </Button>
         <Button
-          @click="showDialog = true"
+          @click="openCreateDialog"
           class="bg-black hover:bg-gray-800 text-white rounded-xl px-5 h-10 shadow-lg shadow-black/10 transition-all hover:scale-[1.02] active:scale-[0.98]"
         >
           <Plus class="w-4 h-4 mr-2" />
@@ -1385,7 +1750,7 @@ const handleInviteSubmit = async () => {
         </div>
         <h3 class="text-lg font-semibold text-gray-900">暂无账号</h3>
         <p class="text-gray-500 text-sm mt-1 mb-6">点击上方按钮创建第一个账号</p>
-        <Button @click="showDialog = true" class="rounded-xl bg-blue-600 hover:bg-blue-700 text-white">
+        <Button @click="openCreateDialog" class="rounded-xl bg-blue-600 hover:bg-blue-700 text-white">
           <Plus class="w-4 h-4 mr-2" />
           新建账号
         </Button>
@@ -1658,6 +2023,59 @@ const handleInviteSubmit = async () => {
         
         <form @submit.prevent="handleSubmit" class="flex-1 min-h-0 flex flex-col">
            <div class="flex-1 min-h-0 px-8 pb-6 space-y-4 overflow-y-auto">
+              <div class="space-y-2 rounded-2xl border border-gray-100 bg-gray-50/70 p-4">
+                <div class="flex items-start justify-between gap-3">
+                  <div class="space-y-1">
+                    <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">Session JSON</Label>
+                    <p class="text-[12px] text-gray-500">
+                      支持常见字段：
+                      <code class="font-mono text-[11px]">email</code>、
+                      <code class="font-mono text-[11px]">accessToken</code>、
+                      <code class="font-mono text-[11px]">refreshToken</code>、
+                      <code class="font-mono text-[11px]">chatgptAccountId</code>、
+                      <code class="font-mono text-[11px]">oaiDeviceId</code>。
+                      若未提供 ChatGPT ID，会尝试用 Access Token 自动补全候选账号。
+                    </p>
+                  </div>
+                  <div class="flex items-center gap-2 shrink-0">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      class="h-10 rounded-xl border-gray-200"
+                      :disabled="parsingSessionJson || !sessionJsonInput.trim()"
+                      @click="handleParseSessionJson"
+                    >
+                      <template v-if="parsingSessionJson">
+                        <span class="animate-spin w-4 h-4 border-2 border-current border-t-transparent rounded-full mr-2"></span>
+                        解析中
+                      </template>
+                      <template v-else>
+                        解析
+                      </template>
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      class="h-10 rounded-xl text-gray-500 hover:text-gray-900"
+                      :disabled="parsingSessionJson || !sessionJsonInput.trim()"
+                      @click="sessionJsonInput = ''; sessionJsonError = ''"
+                    >
+                      清空
+                    </Button>
+                  </div>
+                </div>
+
+                <textarea
+                  v-model="sessionJsonInput"
+                  rows="5"
+                  placeholder='粘贴 GPT session JSON，例如 {"accessToken":"...","refreshToken":"...","email":"..."}'
+                  class="w-full resize-y rounded-2xl border border-gray-200 bg-white px-4 py-3 text-sm font-mono text-gray-700 outline-none transition-all focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
+                ></textarea>
+                <p v-if="sessionJsonError" class="text-[12px] text-red-600">{{ sessionJsonError }}</p>
+              </div>
+
               <div class="space-y-2">
                 <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">邮箱</Label>
                 <Input
